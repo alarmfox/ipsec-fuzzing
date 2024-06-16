@@ -58,7 +58,7 @@ Lo script genera un'immagine Debian e una coppia di chiavi SSH.
 
 ## Esecuzione
 Per eseguire il programma, bisogna definire un file come quello di seguito.
-in cui bisogna sostituire a $SYZKALLER, $KERNEL e $IMAGE i path alle cartelle
+in cui bisogna sostituire a $SYZKALLER, $KERNEL e $IMAGE i path alle cartelle giuste.
 ```json
 {
         "target": "linux/amd64",
@@ -78,3 +78,10 @@ in cui bisogna sostituire a $SYZKALLER, $KERNEL e $IMAGE i path alle cartelle
         }
 }
 ```
+
+Infine, è possibile lanciare syz-manager con il comando:
+```sh 
+./syzkaller/syzkaller/bin/syz-manager -config syzkaller/config.json
+
+```
+
