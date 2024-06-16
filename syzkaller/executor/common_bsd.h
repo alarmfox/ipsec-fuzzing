@@ -18,12 +18,11 @@
 #endif
 #if SYZ_EXECUTOR || SYZ_USB
 #include <dirent.h>
-
-static const char* setup_usb(void)
+static void setup_usb(void)
 {
 	DIR* dir = opendir("/dev");
 	if (dir == NULL)
-		return "failed to open /dev";
+		fail("failed to open /dev");
 
 	bool have_vhci = false;
 	struct dirent* ent = NULL;
@@ -34,14 +33,14 @@ static const char* setup_usb(void)
 			continue;
 		char path[1024];
 		snprintf(path, sizeof(path), "/dev/%s", ent->d_name);
-		if (chmod(path, 0666)) {
-			closedir(dir);
-			return "failed to chmod /dev/vhci";
-		}
+		if (chmod(path, 0666))
+			failmsg("failed to chmod vhci", "path=%s", path);
 		have_vhci = true;
 	}
+	if (!have_vhci)
+		fail("don't have any /dev/vhci devices");
+
 	closedir(dir);
-	return have_vhci ? NULL : "don't have any /dev/vhci devices";
 }
 #endif
 
@@ -49,14 +48,11 @@ static const char* setup_usb(void)
 #include <fcntl.h>
 #include <sys/fault.h>
 #include <sys/stat.h>
-
-static const char* setup_fault(void)
+static void setup_fault(void)
 {
 	if (chmod("/dev/fault", 0666))
-		return "failed to chmod /dev/fault";
-	return NULL;
+		fail("failed to chmod /dev/fault");
 }
-
 static int inject_fault(int nth)
 {
 	struct fault_ioc_enable en;
@@ -75,7 +71,6 @@ static int inject_fault(int nth)
 	return fd;
 }
 #endif
-
 #if SYZ_EXECUTOR
 static int fault_injected(int fd)
 {

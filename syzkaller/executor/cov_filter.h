@@ -1,13 +1,14 @@
 // Copyright 2020 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+#if SYZ_EXECUTOR_USES_SHMEM
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 
 struct cov_filter_t {
-	uint64 pcstart;
-	uint64 pcsize;
+	uint32 pcstart;
+	uint32 pcsize;
 	uint8 bitmap[];
 };
 
@@ -30,7 +31,7 @@ static void init_coverage_filter(char* filename)
 	cov_filter = (cov_filter_t*)mmap(preferred, st.st_size, PROT_READ, MAP_PRIVATE, f, 0);
 	if (cov_filter != preferred)
 		failmsg("failed to mmap coverage filter bitmap", "want=%p, got=%p", preferred, cov_filter);
-	if ((uint32)st.st_size != sizeof(uint64) * 2 + ((cov_filter->pcsize >> 4) / 8 + 2))
+	if ((uint32)st.st_size != sizeof(uint32) * 2 + ((cov_filter->pcsize >> 4) / 8 + 2))
 		fail("bad coverage filter bitmap size");
 	close(f);
 }
@@ -42,12 +43,19 @@ static bool coverage_filter(uint64 pc)
 	if (cov_filter == NULL)
 		fail("coverage filter was enabled but bitmap initialization failed");
 	// Prevent out of bound while searching bitmap.
-	if (pc < cov_filter->pcstart || pc > cov_filter->pcstart + cov_filter->pcsize)
+	uint32 pc32 = (uint32)(pc & 0xffffffff);
+	if (pc32 < cov_filter->pcstart || pc32 > cov_filter->pcstart + cov_filter->pcsize)
 		return false;
 	// For minimizing the size of bitmap, the lowest 4-bit will be dropped.
-	pc -= cov_filter->pcstart;
-	pc = pc >> 4;
-	uint64 idx = pc / 8;
-	uint64 shift = pc % 8;
+	pc32 -= cov_filter->pcstart;
+	pc32 = pc32 >> 4;
+	uint32 idx = pc32 / 8;
+	uint32 shift = pc32 % 8;
 	return (cov_filter->bitmap[idx] & (1 << shift)) > 0;
 }
+
+#else
+static void init_coverage_filter(char* filename)
+{
+}
+#endif

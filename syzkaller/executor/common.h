@@ -319,9 +319,8 @@ static int inject_fault(int nth)
 #endif
 
 #if SYZ_FAULT
-static const char* setup_fault()
+static void setup_fault()
 {
-	return NULL;
 }
 #endif
 
@@ -654,12 +653,11 @@ static void loop(void)
 #if SYZ_EXECUTOR
 			close(kInPipeFd);
 #endif
-#if SYZ_EXECUTOR
+#if SYZ_EXECUTOR && SYZ_EXECUTOR_USES_SHMEM
 			close(kOutPipeFd);
 #endif
 			execute_one();
-#if !SYZ_EXECUTOR && SYZ_HAVE_CLOSE_FDS && !SYZ_THREADED
-			// Executor's execute_one has already called close_fds.
+#if SYZ_HAVE_CLOSE_FDS && !SYZ_THREADED
 			close_fds();
 #endif
 			doexit(0);
@@ -673,15 +671,16 @@ static void loop(void)
 		// should be as efficient as sigtimedwait.
 		int status = 0;
 		uint64 start = current_time_ms();
-#if SYZ_EXECUTOR
+#if SYZ_EXECUTOR && SYZ_EXECUTOR_USES_SHMEM
 		uint64 last_executed = start;
 		uint32 executed_calls = __atomic_load_n(output_data, __ATOMIC_RELAXED);
 #endif
 		for (;;) {
-			sleep_ms(10);
 			if (waitpid(-1, &status, WNOHANG | WAIT_FLAGS) == pid)
 				break;
+			sleep_ms(1);
 #if SYZ_EXECUTOR
+#if SYZ_EXECUTOR_USES_SHMEM
 			// Even though the test process executes exit at the end
 			// and execution time of each syscall is bounded by syscall_timeout_ms (~50ms),
 			// this backup watchdog is necessary and its performance is important.
@@ -704,6 +703,10 @@ static void loop(void)
 			if ((now - start < program_timeout_ms) &&
 			    (now - start < min_timeout_ms || now - last_executed < inactive_timeout_ms))
 				continue;
+#else
+			if (current_time_ms() - start < program_timeout_ms)
+				continue;
+#endif
 #else
 			if (current_time_ms() - start < /*{{{PROGRAM_TIMEOUT_MS}}}*/)
 				continue;
@@ -768,35 +771,26 @@ int main(void)
 #if SYZ_CGROUPS
 	setup_cgroups();
 #endif
-	const char* reason;
-	(void)reason;
 #if SYZ_BINFMT_MISC
-	if ((reason = setup_binfmt_misc()))
-		printf("the reproducer may not work as expected: binfmt_misc setup failed: %s\n", reason);
+	setup_binfmt_misc();
 #endif
 #if SYZ_LEAK
-	if ((reason = setup_leak()))
-		printf("the reproducer may not work as expected: leak checking setup failed: %s\n", reason);
+	setup_leak();
 #endif
 #if SYZ_FAULT
-	if ((reason = setup_fault()))
-		printf("the reproducer may not work as expected: fault injection setup failed: %s\n", reason);
+	setup_fault();
 #endif
 #if SYZ_KCSAN
-	if ((reason = setup_kcsan()))
-		printf("the reproducer may not work as expected: KCSAN setup failed: %s\n", reason);
+	setup_kcsan();
 #endif
 #if SYZ_USB
-	if ((reason = setup_usb()))
-		printf("the reproducer may not work as expected: USB injection setup failed: %s\n", reason);
+	setup_usb();
 #endif
 #if SYZ_802154
-	if ((reason = setup_802154()))
-		printf("the reproducer may not work as expected: 802154 injection setup failed: %s\n", reason);
+	setup_802154();
 #endif
 #if SYZ_SWAP
-	if ((reason = setup_swap()))
-		printf("the reproducer may not work as expected: swap setup failed: %s\n", reason);
+	setup_swap();
 #endif
 #if SYZ_HANDLE_SEGV
 	install_segv_handler();

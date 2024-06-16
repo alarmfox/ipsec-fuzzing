@@ -8,6 +8,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#define SYZ_EXECUTOR 1
+
 #if SYZ_EXECUTOR
 const int kExtraCoverSize = 256 << 10;
 struct cover_t;
@@ -735,6 +737,349 @@ static void initialize_tun(void)
 	close(sock);
 }
 #endif
+#if SYZ_EXECUTOR || (SYZ_NET_DEVICES && SYZ_NIC_VF) || SYZ_SWAP
+static int runcmdline(char* cmdline)
+{
+	debug("%s\n", cmdline);
+	int ret = system(cmdline);
+	if (ret) {
+		debug("FAIL: %s\n", cmdline);
+	}
+	return ret;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_emit_ipsec || __NR_syz_flush_ipsec
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/rtnetlink.h>
+#include <linux/veth.h>
+#include <linux/xfrm.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+
+static const int spi = 0x12345;
+static const char* key = "0123456789abcdef";
+
+static int send_netlink_msg(int sockfd, struct nlmsghdr* nlh)
+{
+	struct sockaddr_nl sa = {0};
+	struct iovec iov = {0};
+	struct msghdr msg = {0};
+
+	sa.nl_family = AF_NETLINK;
+	iov.iov_base = (void*)nlh;
+	iov.iov_len = nlh->nlmsg_len;
+	msg.msg_name = (void*)&sa;
+	msg.msg_namelen = sizeof(sa);
+	msg.msg_iov = &iov;
+	msg.msg_iovlen = 1;
+
+	return sendmsg(sockfd, &msg, 0);
+}
+
+// Function to add IPsec state
+static void add_ipsec_state(int socket, const char* src, const char* dst, const char* key, uint32_t spi)
+{
+	struct {
+		struct nlmsghdr nlh;
+		struct xfrm_usersa_info xsinfo;
+		char buf[1024];
+	} req;
+
+	memset(&req, 0, sizeof(req));
+
+	// Fill Netlink header
+	req.nlh.nlmsg_len = NLMSG_LENGTH(sizeof(req.xsinfo));
+	req.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_EXCL;
+	req.nlh.nlmsg_type = XFRM_MSG_NEWSA;
+
+	// Fill XFRM state information
+	req.xsinfo.family = AF_INET; // Change to AF_INET6 for IPv6
+	req.xsinfo.id.proto = IPPROTO_ESP;
+	req.xsinfo.id.spi = htonl(spi);
+	inet_pton(AF_INET, src, &req.xsinfo.saddr);
+	inet_pton(AF_INET, dst, &req.xsinfo.id.daddr);
+	req.xsinfo.mode = XFRM_MODE_TRANSPORT;
+	req.xsinfo.flags = 0;
+
+	// Add encryption algorithm
+	struct xfrm_algo_aead* alg = (struct xfrm_algo_aead*)req.buf;
+	strcpy(alg->alg_name, "rfc3686(ctr(aes))");
+	alg->alg_key_len = 128; // Key length in bits
+	memcpy(alg->alg_key, key, 16); // Key length in bytes
+
+	req.nlh.nlmsg_len += sizeof(*alg);
+
+	// Send message
+	if (send_netlink_msg(socket, &req.nlh) < 0) {
+		fail("send netlink message");
+	}
+}
+static void add_ipsec_policy_out(int socket, const char* src, const char* dst)
+{
+	struct {
+		struct nlmsghdr nlh;
+		struct xfrm_userpolicy_info xpinfo;
+		char buf[1024];
+	} req;
+
+	memset(&req, 0, sizeof(req));
+
+	// Fill Netlink header
+	req.nlh.nlmsg_len = NLMSG_LENGTH(sizeof(req.xpinfo));
+	req.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_EXCL;
+	req.nlh.nlmsg_type = XFRM_MSG_NEWPOLICY;
+
+	// Fill XFRM policy information
+	req.xpinfo.dir = XFRM_POLICY_OUT;
+	req.xpinfo.action = XFRM_POLICY_ALLOW;
+	inet_pton(AF_INET, src, &req.xpinfo.sel.saddr.a4);
+	inet_pton(AF_INET, dst, &req.xpinfo.sel.daddr.a4);
+	req.xpinfo.sel.prefixlen_s = 32;
+	req.xpinfo.sel.prefixlen_d = 32;
+	req.xpinfo.sel.proto = IPPROTO_ESP;
+
+	// Add XFRM template
+	struct xfrm_user_tmpl* tmpl = (struct xfrm_user_tmpl*)req.buf;
+	tmpl->family = AF_INET; // Change to AF_INET6 for IPv6
+	tmpl->id.proto = IPPROTO_ESP;
+	tmpl->mode = XFRM_MODE_TRANSPORT;
+
+	req.nlh.nlmsg_len += sizeof(*tmpl);
+
+	// Send message
+	if (send_netlink_msg(socket, &req.nlh) < 0) {
+		fail("netlink ipsec policy");
+	}
+}
+
+static void add_ipsec_policy_in(int socket, const char* src, const char* dst)
+{
+	struct {
+		struct nlmsghdr nlh;
+		struct xfrm_userpolicy_info xpinfo;
+		char buf[1024];
+	} req;
+
+	memset(&req, 0, sizeof(req));
+
+	// Fill Netlink header
+	req.nlh.nlmsg_len = NLMSG_LENGTH(sizeof(req.xpinfo));
+	req.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_EXCL;
+	req.nlh.nlmsg_type = XFRM_MSG_NEWPOLICY;
+
+	// Fill XFRM policy information
+	req.xpinfo.dir = XFRM_POLICY_IN;
+	req.xpinfo.action = XFRM_POLICY_ALLOW;
+	inet_pton(AF_INET, src, &req.xpinfo.sel.saddr.a4);
+	inet_pton(AF_INET, dst, &req.xpinfo.sel.daddr.a4);
+	req.xpinfo.sel.prefixlen_s = 32;
+	req.xpinfo.sel.prefixlen_d = 32;
+	req.xpinfo.sel.proto = IPPROTO_ESP;
+
+	// Add XFRM template
+	struct xfrm_user_tmpl* tmpl = (struct xfrm_user_tmpl*)req.buf;
+	tmpl->family = AF_INET; // Change to AF_INET6 for IPv6
+	tmpl->id.proto = IPPROTO_ESP;
+	tmpl->mode = XFRM_MODE_TRANSPORT;
+
+	req.nlh.nlmsg_len += sizeof(*tmpl);
+
+	// Send message
+	if (send_netlink_msg(socket, &req.nlh) < 0) {
+		fail("netlink ipsec policy");
+	}
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_emit_ipsec
+static long syz_emit_ipsec(volatile long a0, volatile long a1, volatile long a2)
+{
+	if (tunfd < 0)
+		return (uintptr_t)-1;
+
+	uint32 length = a0;
+	char* data = (char*)a1;
+
+	if (length < sizeof(struct ethhdr) + sizeof(struct iphdr))
+		return (uintptr_t)-1;
+
+	struct ethhdr* eth = (struct ethhdr*)data;
+	if (ntohs(eth->h_proto) != ETH_P_IP)
+		return (uintptr_t)-1;
+
+	struct iphdr* ip = (struct iphdr*)(data + sizeof(struct ethhdr));
+	char src_ip[INET_ADDRSTRLEN];
+	char dst_ip[INET_ADDRSTRLEN];
+
+	inet_ntop(AF_INET, &ip->saddr, src_ip, INET_ADDRSTRLEN);
+	inet_ntop(AF_INET, &ip->daddr, dst_ip, INET_ADDRSTRLEN);
+
+	int sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_XFRM);
+	add_ipsec_state(sock, src_ip, dst_ip, key, spi);
+	add_ipsec_policy_out(sock, src_ip, dst_ip);
+	add_ipsec_policy_in(sock, dst_ip, src_ip);
+	close(sock);
+
+	return write(tunfd, data, length);
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_send_ipsec
+#define ESP_SPI 0x12345678
+#define ESP_SEQ 1
+#define ICMP_PROTO 1
+#define ESP_PROTO 50
+
+// ESP Header structure
+struct esp_header {
+	uint32_t spi;
+	uint32_t seq;
+};
+
+// ESP Trailer structure
+struct esp_trailer {
+	uint8_t pad_len;
+	uint8_t next_hdr;
+};
+
+// Function to encapsulate ICMP packet into ESP packet
+static long encapsulate_ip_in_esp(uint8_t* ip_packet, size_t ip_len, uint8_t* esp_packet, size_t* esp_len)
+{
+	struct esp_header esp_hdr;
+    struct esp_trailer esp_trl;
+    uint8_t next_hdr;
+
+    // Determine if the packet is IPv4 or IPv6
+    uint8_t version = (ip_packet[0] >> 4);
+    if (version == 4) {
+        // IPv4 packet
+        next_hdr = ip_packet[9]; // Protocol field in IPv4 header
+    } else if (version == 6) {
+        // IPv6 packet
+        next_hdr = ip_packet[6]; // Next Header field in IPv6 header
+    } else {
+        // Unknown IP version
+        return -1;
+    }
+
+    // Initialize ESP header
+    esp_hdr.spi = htonl(ESP_SPI);
+    esp_hdr.seq = htonl(ESP_SEQ);
+
+    // Copy ESP header to the ESP packet
+    memcpy(esp_packet, &esp_hdr, sizeof(esp_hdr));
+    uint8_t *esp_payload = esp_packet + sizeof(esp_hdr);
+
+    // Copy the IP packet to the ESP payload
+    memcpy(esp_payload, ip_packet, ip_len);
+
+    // Initialize ESP trailer
+    esp_trl.pad_len = 0;  // No padding needed for simplicity
+    esp_trl.next_hdr = next_hdr; // Next header (IPv4 or IPv6)
+
+    // Copy ESP trailer to the ESP packet
+    memcpy(esp_payload + ip_len, &esp_trl, sizeof(esp_trl));
+
+    // Final length of the ESP packet
+    *esp_len = sizeof(esp_hdr) + ip_len + sizeof(esp_trl);
+
+    return 0;
+}
+static long syz_send_ipsec(volatile long a0, volatile long a1, volatile long a2)
+{
+	int sock = (int)a0;
+	int length = (int)a2;
+	uint8_t* data = (uint8_t*)a0;
+	uint8_t* esp = 0;
+	size_t* len = 0;
+	int err;
+
+	err = encapsulate_ip_in_esp(data, length, esp, len);
+
+	if (err < 0)
+		return err;
+
+	return write(sock, esp, *len);
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_flush_ipsec
+static void flush_ipsec_state()
+{
+	int sockfd;
+	struct {
+		struct nlmsghdr nlh;
+	} req;
+
+	memset(&req, 0, sizeof(req));
+
+	// Create Netlink socket
+	sockfd = socket(AF_NETLINK, SOCK_RAW, NETLINK_XFRM);
+	if (sockfd < 0) {
+		fail("netlink ipsec policy");
+	}
+
+	// Fill Netlink header
+	req.nlh.nlmsg_len = NLMSG_LENGTH(0);
+	req.nlh.nlmsg_flags = NLM_F_REQUEST;
+	req.nlh.nlmsg_type = XFRM_MSG_FLUSHSA;
+
+	// Send message
+	if (send_netlink_msg(sockfd, &req.nlh) < 0) {
+		fail("netlink ipsec policy");
+	}
+
+	close(sockfd);
+}
+void flush_ipsec_policy()
+{
+	int sockfd;
+	struct {
+		struct nlmsghdr nlh;
+	} req;
+
+	memset(&req, 0, sizeof(req));
+
+	// Create Netlink socket
+	sockfd = socket(AF_NETLINK, SOCK_RAW, NETLINK_XFRM);
+	if (sockfd < 0) {
+		fail("netlink socket flush");
+	}
+
+	// Fill Netlink header
+	req.nlh.nlmsg_len = NLMSG_LENGTH(0);
+	req.nlh.nlmsg_flags = NLM_F_REQUEST;
+	req.nlh.nlmsg_type = XFRM_MSG_FLUSHPOLICY;
+
+	// Send message
+	if (send_netlink_msg(sockfd, &req.nlh) < 0) {
+		fail("netlink socket send");
+	}
+
+	close(sockfd);
+}
+static long syz_flush_ipsec(volatile long a0)
+{
+	int n = (int)a0;
+	if (n < 0) {
+		flush_ipsec_policy();
+	} else if (n == 0) {
+		flush_ipsec_policy();
+		flush_ipsec_state();
+	} else {
+		flush_ipsec_state();
+	}
+	return 0;
+}
+#endif
 
 #if SYZ_EXECUTOR || __NR_syz_init_net_socket || SYZ_DEVLINK_PCI || __NR_syz_socket_connect_nvme_tcp
 const int kInitNetNsFd = 201; // see kMaxFd
@@ -1153,18 +1498,6 @@ static void initialize_wifi_devices(void)
 	}
 
 	close(sock);
-}
-#endif
-
-#if SYZ_EXECUTOR || (SYZ_NET_DEVICES && SYZ_NIC_VF) || SYZ_SWAP
-static int runcmdline(char* cmdline)
-{
-	debug("%s\n", cmdline);
-	int ret = system(cmdline);
-	if (ret) {
-		debug("FAIL: %s\n", cmdline);
-	}
-	return ret;
 }
 #endif
 
@@ -2400,7 +2733,7 @@ static long syz_open_dev(volatile long a0, volatile long a1, volatile long a2)
 		sprintf(buf, "/dev/%s/%d:%d", a0 == 0xc ? "char" : "block", (uint8)a1, (uint8)a2);
 		return open(buf, O_RDWR, 0);
 	} else {
-		// syz_open_dev(dev ptr[in, string["/dev/foo"]], id intptr, flags flags[open_flags]) fd
+		// syz_open_dev(dev strconst, id intptr, flags flags[open_flags]) fd
 		char buf[1024];
 		char* hash;
 		strncpy(buf, (char*)a0, sizeof(buf) - 1);
@@ -4207,6 +4540,7 @@ static int namespace_sandbox_proc(void* arg)
 	// TODO: we should create tun in the init net namespace and use setns
 	// to move it to the target namespace.
 	initialize_tun();
+
 #endif
 #if SYZ_EXECUTOR || SYZ_NET_DEVICES
 	initialize_netdevices();
@@ -4455,6 +4789,7 @@ static int do_sandbox_android(uint64 sandbox_arg)
 #endif
 #if SYZ_EXECUTOR || SYZ_NET_INJECTION
 	initialize_tun();
+
 #endif
 #if SYZ_EXECUTOR || SYZ_NET_DEVICES
 	initialize_netdevices();
@@ -4818,16 +5153,11 @@ static void setup_test()
 #endif
 
 #if SYZ_EXECUTOR || SYZ_CLOSE_FDS
-#include <sys/syscall.h>
 #define SYZ_HAVE_CLOSE_FDS 1
 static void close_fds()
 {
 #if SYZ_EXECUTOR
 	if (!flag_close_fds)
-		return;
-#endif
-#ifdef SYS_close_range
-	if (!syscall(SYS_close_range, 3, MAX_FDS, 0))
 		return;
 #endif
 	// Keeping a 9p transport pipe open will hang the proccess dead,
@@ -4842,16 +5172,16 @@ static void close_fds()
 #if SYZ_EXECUTOR || SYZ_FAULT
 #include <errno.h>
 
-static const char* setup_fault()
+static void setup_fault()
 {
 	int fd = open("/proc/self/make-it-fail", O_WRONLY);
 	if (fd == -1)
-		return "CONFIG_FAULT_INJECTION is not enabled";
+		fail("CONFIG_FAULT_INJECTION is not enabled");
 	close(fd);
 
 	fd = open("/proc/thread-self/fail-nth", O_WRONLY);
 	if (fd == -1)
-		return "kernel does not have systematic fault injection support";
+		fail("kernel does not have systematic fault injection support");
 	close(fd);
 
 	static struct {
@@ -4872,10 +5202,9 @@ static const char* setup_fault()
 		if (!write_file(files[i].file, files[i].val)) {
 			debug("failed to write %s: %d\n", files[i].file, errno);
 			if (files[i].fatal)
-				return "failed to write fault injection file";
+				failmsg("failed to write fault injection file", "file=%s", files[i].file);
 		}
 	}
-	return NULL;
 }
 #endif
 
@@ -4888,23 +5217,22 @@ static const char* setup_fault()
 
 #define KMEMLEAK_FILE "/sys/kernel/debug/kmemleak"
 
-static const char* setup_leak()
+static void setup_leak()
 {
 	if (!write_file(KMEMLEAK_FILE, "scan=off")) {
 		if (errno == EBUSY)
-			return "KMEMLEAK disabled: increase CONFIG_DEBUG_KMEMLEAK_EARLY_LOG_SIZE"
-			       " or unset CONFIG_DEBUG_KMEMLEAK_DEFAULT_OFF";
-		return "failed to write(kmemleak, \"scan=off\")";
+			fail("KMEMLEAK disabled: increase CONFIG_DEBUG_KMEMLEAK_EARLY_LOG_SIZE"
+			     " or unset CONFIG_DEBUG_KMEMLEAK_DEFAULT_OFF");
+		fail("failed to write(kmemleak, \"scan=off\")");
 	}
 	// Flush boot leaks.
 	if (!write_file(KMEMLEAK_FILE, "scan"))
-		return "failed to write(kmemleak, \"scan\")";
+		fail("failed to write(kmemleak, \"scan\")");
 	sleep(5); // account for MSECS_MIN_AGE
 	if (!write_file(KMEMLEAK_FILE, "scan"))
-		return "failed to write(kmemleak, \"scan\")";
+		fail("failed to write(kmemleak, \"scan\")");
 	if (!write_file(KMEMLEAK_FILE, "clear"))
-		return "failed to write(kmemleak, \"clear\")";
-	return NULL;
+		fail("failed to write(kmemleak, \"clear\")");
 }
 
 #define SYZ_HAVE_LEAK_CHECK 1
@@ -4991,34 +5319,56 @@ static void check_leaks(void)
 #include <sys/stat.h>
 #include <sys/types.h>
 
-static const char* setup_binfmt_misc()
+static void setup_binfmt_misc()
 {
 	if (mount(0, "/proc/sys/fs/binfmt_misc", "binfmt_misc", 0, 0)) {
 		debug("mount(binfmt_misc) failed: %d\n", errno);
-		return NULL;
+		return;
 	}
 	if (!write_file("/proc/sys/fs/binfmt_misc/register", ":syz0:M:0:\x01::./file0:") ||
 	    !write_file("/proc/sys/fs/binfmt_misc/register", ":syz1:M:1:\x02::./file0:POC"))
-		return "write(/proc/sys/fs/binfmt_misc/register) failed";
-	return NULL;
+		fail("write(/proc/sys/fs/binfmt_misc/register) failed");
 }
 #endif
 
 #if SYZ_EXECUTOR || SYZ_KCSAN
-static const char* setup_kcsan()
+#define KCSAN_DEBUGFS_FILE "/sys/kernel/debug/kcsan"
+
+static void setup_kcsan()
 {
-	if (!write_file("/sys/kernel/debug/kcsan", "on"))
-		return "write(/sys/kernel/debug/kcsan, on) failed";
-	return NULL;
+	if (!write_file(KCSAN_DEBUGFS_FILE, "on"))
+		fail("write(/sys/kernel/debug/kcsan, on) failed");
 }
+
+#if SYZ_EXECUTOR // currently only used by executor
+static void setup_kcsan_filterlist(char** frames, int nframes, bool suppress)
+{
+	int fd = open(KCSAN_DEBUGFS_FILE, O_WRONLY);
+	if (fd == -1)
+		fail("failed to open kcsan debugfs file");
+
+	printf("%s KCSAN reports in functions: ",
+	       suppress ? "suppressing" : "only showing");
+	if (!suppress)
+		dprintf(fd, "whitelist\n");
+	for (int i = 0; i < nframes; ++i) {
+		printf("'%s' ", frames[i]);
+		dprintf(fd, "!%s\n", frames[i]);
+	}
+	printf("\n");
+
+	close(fd);
+}
+
+#define SYZ_HAVE_KCSAN 1
+#endif
 #endif
 
 #if SYZ_EXECUTOR || SYZ_USB
-static const char* setup_usb()
+static void setup_usb()
 {
 	if (chmod("/dev/raw-gadget", 0666))
-		return "failed to chmod /dev/raw-gadget";
-	return NULL;
+		fail("failed to chmod /dev/raw-gadget");
 }
 #endif
 
@@ -5075,9 +5425,8 @@ static void setup_sysctl()
 		{"/proc/sys/kernel/cad_pid", mypid},
 	};
 	for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
-		if (!write_file(files[i].name, files[i].data)) {
-			debug("write to %s failed: %s\n", files[i].name, strerror(errno));
-		}
+		if (!write_file(files[i].name, files[i].data))
+			printf("write to %s failed: %s\n", files[i].name, strerror(errno));
 	}
 }
 #endif
@@ -5092,56 +5441,44 @@ static void setup_sysctl()
 #define NL802154_ATTR_IFINDEX 3
 #define NL802154_ATTR_SHORT_ADDR 10
 
-static const char* setup_802154()
+static void setup_802154()
 {
-	const char* error = NULL;
-	int sock_generic = -1;
 	int sock_route = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
-	if (sock_route == -1) {
-		error = "socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE) failed";
-		goto fail;
-	}
-	sock_generic = socket(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC);
-	if (sock_generic == -1) {
-		error = "socket(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC) failed";
-		goto fail;
-	}
-	{
-		int nl802154_family_id = netlink_query_family_id(&nlmsg, sock_generic, "nl802154", true);
-		for (int i = 0; i < 2; i++) {
-			// wpan0/1 are created by CONFIG_IEEE802154_HWSIM.
-			// sys/linux/socket_ieee802154.txt knowns about these names and consts.
-			char devname[] = "wpan0";
-			devname[strlen(devname) - 1] += i;
-			uint64 hwaddr = 0xaaaaaaaaaaaa0002 + (i << 8);
-			uint16 shortaddr = 0xaaa0 + i;
-			int ifindex = if_nametoindex(devname);
-			struct genlmsghdr genlhdr;
-			memset(&genlhdr, 0, sizeof(genlhdr));
-			genlhdr.cmd = NL802154_CMD_SET_SHORT_ADDR;
-			netlink_init(&nlmsg, nl802154_family_id, 0, &genlhdr, sizeof(genlhdr));
-			netlink_attr(&nlmsg, NL802154_ATTR_IFINDEX, &ifindex, sizeof(ifindex));
-			netlink_attr(&nlmsg, NL802154_ATTR_SHORT_ADDR, &shortaddr, sizeof(shortaddr));
-			if (netlink_send(&nlmsg, sock_generic) < 0) {
-				error = "NL802154_CMD_SET_SHORT_ADDR failed";
-				goto fail;
-			}
-			netlink_device_change(&nlmsg, sock_route, devname, true, 0, &hwaddr, sizeof(hwaddr), 0);
-			if (i == 0) {
-				netlink_add_device_impl(&nlmsg, "lowpan", "lowpan0", false);
-				netlink_done(&nlmsg);
-				netlink_attr(&nlmsg, IFLA_LINK, &ifindex, sizeof(ifindex));
-				if (netlink_send(&nlmsg, sock_route) < 0) {
-					error = "netlink: adding device lowpan0 type lowpan link wpan0";
-					goto fail;
-				}
-			}
+	if (sock_route == -1)
+		fail("socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE) failed");
+	int sock_generic = socket(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC);
+	if (sock_generic < 0)
+		fail("socket(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC) failed");
+	int nl802154_family_id = netlink_query_family_id(&nlmsg, sock_generic, "nl802154", true);
+	for (int i = 0; i < 2; i++) {
+		// wpan0/1 are created by CONFIG_IEEE802154_HWSIM.
+		// sys/linux/socket_ieee802154.txt knowns about these names and consts.
+		char devname[] = "wpan0";
+		devname[strlen(devname) - 1] += i;
+		uint64 hwaddr = 0xaaaaaaaaaaaa0002 + (i << 8);
+		uint16 shortaddr = 0xaaa0 + i;
+		int ifindex = if_nametoindex(devname);
+		struct genlmsghdr genlhdr;
+		memset(&genlhdr, 0, sizeof(genlhdr));
+		genlhdr.cmd = NL802154_CMD_SET_SHORT_ADDR;
+		netlink_init(&nlmsg, nl802154_family_id, 0, &genlhdr, sizeof(genlhdr));
+		netlink_attr(&nlmsg, NL802154_ATTR_IFINDEX, &ifindex, sizeof(ifindex));
+		netlink_attr(&nlmsg, NL802154_ATTR_SHORT_ADDR, &shortaddr, sizeof(shortaddr));
+		int err = netlink_send(&nlmsg, sock_generic);
+		if (err < 0)
+			fail("NL802154_CMD_SET_SHORT_ADDR failed");
+		netlink_device_change(&nlmsg, sock_route, devname, true, 0, &hwaddr, sizeof(hwaddr), 0);
+		if (i == 0) {
+			netlink_add_device_impl(&nlmsg, "lowpan", "lowpan0", false);
+			netlink_done(&nlmsg);
+			netlink_attr(&nlmsg, IFLA_LINK, &ifindex, sizeof(ifindex));
+			int err = netlink_send(&nlmsg, sock_route);
+			if (err < 0)
+				fail("netlink: adding device lowpan0 type lowpan link wpan0");
 		}
 	}
-fail:
 	close(sock_route);
 	close(sock_generic);
-	return error;
 }
 #endif
 
@@ -5692,7 +6029,7 @@ static long syz_pkey_set(volatile long pkey, volatile long val)
 #define SWAP_FILE "./swap-file"
 #define SWAP_FILE_SIZE (128 * 1000 * 1000) // 128 MB.
 
-static const char* setup_swap()
+static void setup_swap()
 {
 	// The call must be idempotent, so first disable swap and remove the swap file.
 	swapoff(SWAP_FILE);
@@ -5700,7 +6037,7 @@ static const char* setup_swap()
 	// Zero-fill the file.
 	int fd = open(SWAP_FILE, O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
 	if (fd == -1)
-		return "swap file open failed";
+		failmsg("swap file open failed", "file: %s", SWAP_FILE);
 	// We cannot do ftruncate -- swapon complains about this. Do fallocate instead.
 	fallocate(fd, FALLOC_FL_ZERO_RANGE, 0, SWAP_FILE_SIZE);
 	close(fd);
@@ -5708,11 +6045,11 @@ static const char* setup_swap()
 	char cmdline[64];
 	sprintf(cmdline, "mkswap %s", SWAP_FILE);
 	if (runcmdline(cmdline))
-		return "mkswap failed";
+		fail("mkswap failed");
 	if (swapon(SWAP_FILE, SWAP_FLAG_PREFER) == 1)
-		return "swapon failed";
-	return NULL;
+		failmsg("swapon failed", "file: %s", SWAP_FILE);
 }
+
 #endif
 
 #if SYZ_EXECUTOR || __NR_syz_pidfd_open

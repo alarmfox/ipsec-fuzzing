@@ -42,16 +42,6 @@
 
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 
-#ifndef __has_feature
-#define __has_feature(x) 0
-#endif
-
-#if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
-constexpr bool kAddressSanitizer = true;
-#else
-constexpr bool kAddressSanitizer = false;
-#endif
-
 // uint64 is impossible to printf without using the clumsy and verbose "%" PRId64.
 // So we define and use uint64. Note: pkg/csource does s/uint64/uint64/.
 // Also define uint32/16/8 for consistency.
@@ -125,6 +115,15 @@ static void receive_handshake();
 static void reply_handshake();
 #endif
 
+#if SYZ_EXECUTOR_USES_SHMEM
+// The output region is the only thing in executor process for which consistency matters.
+// If it is corrupted ipc package will fail to parse its contents and panic.
+// But fuzzer constantly invents new ways of how to corrupt the region,
+// so we map the region at a (hopefully) hard to guess address with random offset,
+// surrounded by unmapped pages.
+// The address chosen must also work on 32-bit kernels with 1GB user address space.
+const uint64 kOutputBase = 0x1b2bc20000ull;
+
 #if SYZ_EXECUTOR_USES_FORK_SERVER
 // Allocating (and forking) virtual memory for each executed process is expensive, so we only mmap
 // the amount we might possibly need for the specific received prog.
@@ -152,6 +151,7 @@ static uint32* write_output_64(uint64 v);
 static void write_completed(uint32 completed);
 static uint32 hash(uint32 a);
 static bool dedup(uint32 sig);
+#endif // if SYZ_EXECUTOR_USES_SHMEM
 
 uint64 start_time_ms = 0;
 
@@ -218,8 +218,8 @@ const uint64 binary_format_stroct = 4;
 const uint64 no_copyout = -1;
 
 static int running;
-static uint32 completed;
-static bool is_kernel_64_bit = true;
+uint32 completed;
+bool is_kernel_64_bit = true;
 
 static uint8* input_data;
 
@@ -316,6 +316,7 @@ struct execute_req {
 	uint64 syscall_timeout_ms;
 	uint64 program_timeout_ms;
 	uint64 slowdown_scale;
+	uint64 prog_size;
 };
 
 struct execute_reply {
@@ -369,7 +370,7 @@ typedef char kcov_comparison_size[sizeof(kcov_comparison_t) == 4 * sizeof(uint64
 
 struct feature_t {
 	rpc::Feature id;
-	const char* (*setup)();
+	void (*setup)();
 };
 
 static thread_t* schedule_call(int call_index, int call_num, uint64 copyout_index, uint64 num_args, uint64* args, uint8* pos, call_props_t call_props);
@@ -409,10 +410,6 @@ static void setup_features(char** enable, int n);
 #error "unknown OS"
 #endif
 
-#if !SYZ_HAVE_FEATURES
-static feature_t features[] = {};
-#endif
-
 #include "cov_filter.h"
 
 #include "test.h"
@@ -447,8 +444,8 @@ int main(int argc, char** argv)
 #endif
 		return 0;
 	}
-	if (argc >= 2 && strcmp(argv[1], "test") == 0)
-		return run_tests(argc == 3 ? argv[2] : nullptr);
+	if (argc == 2 && strcmp(argv[1], "test") == 0)
+		return run_tests();
 
 	if (argc < 2 || strcmp(argv[1], "exec") != 0) {
 		fprintf(stderr, "unknown command");
@@ -460,11 +457,16 @@ int main(int argc, char** argv)
 	os_init(argc, argv, (char*)SYZ_DATA_OFFSET, SYZ_NUM_PAGES * SYZ_PAGE_SIZE);
 	current_thread = &threads[0];
 
-	void* mmap_out = mmap(NULL, kMaxInput, PROT_READ, MAP_SHARED, kInFd, 0);
+#if SYZ_EXECUTOR_USES_SHMEM
+	void* mmap_out = mmap(NULL, kMaxInput, PROT_READ, MAP_PRIVATE, kInFd, 0);
+#else
+	void* mmap_out = mmap(NULL, kMaxInput, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+#endif
 	if (mmap_out == MAP_FAILED)
 		fail("mmap of input file failed");
 	input_data = static_cast<uint8*>(mmap_out);
 
+#if SYZ_EXECUTOR_USES_SHMEM
 	mmap_output(kInitialOutput);
 	// Prevent test programs to mess with these fds.
 	// Due to races in collider mode, a program can e.g. ftruncate one of these fds,
@@ -475,6 +477,7 @@ int main(int argc, char** argv)
 #endif
 	// For SYZ_EXECUTOR_USES_FORK_SERVER, close(kOutFd) is invoked in the forked child,
 	// after the program has been received.
+#endif // if  SYZ_EXECUTOR_USES_SHMEM
 
 	use_temporary_dir();
 	install_segv_handler();
@@ -560,6 +563,7 @@ int main(int argc, char** argv)
 #endif
 }
 
+#if SYZ_EXECUTOR_USES_SHMEM
 // This method can be invoked as many times as one likes - MMAP_FIXED can overwrite the previous
 // mapping without any problems. The only precondition - kOutFd must not be closed.
 static void mmap_output(int size)
@@ -569,22 +573,9 @@ static void mmap_output(int size)
 	if (size % SYZ_PAGE_SIZE != 0)
 		failmsg("trying to mmap output area that is not divisible by page size", "page=%d,area=%d", SYZ_PAGE_SIZE, size);
 	uint32* mmap_at = NULL;
-	int fixed_flag = MAP_FIXED;
 	if (output_data == NULL) {
-		if (kAddressSanitizer) {
-			// Don't use fixed address under ASAN b/c it may overlap with shadow.
-			fixed_flag = 0;
-		} else {
-			// It's the first time we map output region - generate its location.
-			// The output region is the only thing in executor process for which consistency matters.
-			// If it is corrupted ipc package will fail to parse its contents and panic.
-			// But fuzzer constantly invents new ways of how to corrupt the region,
-			// so we map the region at a (hopefully) hard to guess address with random offset,
-			// surrounded by unmapped pages.
-			// The address chosen must also work on 32-bit kernels with 1GB user address space.
-			const uint64 kOutputBase = 0x1b2bc20000ull;
-			mmap_at = (uint32*)(kOutputBase + (1 << 20) * (getpid() % 128));
-		}
+		// It's the first time we map output region - generate its location.
+		output_data = mmap_at = (uint32*)(kOutputBase + (1 << 20) * (getpid() % 128));
 	} else {
 		// We are expanding the mmapped region. Adjust the parameters to avoid mmapping already
 		// mmapped area as much as possible.
@@ -592,13 +583,12 @@ static void mmap_output(int size)
 		mmap_at = (uint32*)((char*)(output_data) + output_size);
 	}
 	void* result = mmap(mmap_at, size - output_size,
-			    PROT_READ | PROT_WRITE, MAP_SHARED | fixed_flag, kOutFd, output_size);
-	if (result == MAP_FAILED || (mmap_at && result != mmap_at))
+			    PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, kOutFd, output_size);
+	if (result != mmap_at)
 		failmsg("mmap of output file failed", "want %p, got %p", mmap_at, result);
-	if (output_data == NULL)
-		output_data = static_cast<uint32*>(result);
 	output_size = size;
 }
+#endif
 
 void setup_control_pipes()
 {
@@ -674,6 +664,8 @@ void receive_execute()
 		fail("control pipe read failed");
 	if (req.magic != kInMagic)
 		failmsg("bad execute request magic", "magic=0x%llx", req.magic);
+	if (req.prog_size > kMaxInput)
+		failmsg("bad execute prog size", "size=0x%llx", req.prog_size);
 	parse_env_flags(req.env_flags);
 	procid = req.pid;
 	syscall_timeout_ms = req.syscall_timeout_ms;
@@ -687,13 +679,31 @@ void receive_execute()
 	flag_coverage_filter = req.exec_flags & (1 << 5);
 
 	debug("[%llums] exec opts: procid=%llu threaded=%d cover=%d comps=%d dedup=%d signal=%d"
-	      " timeouts=%llu/%llu/%llu filter=%d\n",
+	      " timeouts=%llu/%llu/%llu prog=%llu filter=%d\n",
 	      current_time_ms() - start_time_ms, procid, flag_threaded, flag_collect_cover,
 	      flag_comparisons, flag_dedup_cover, flag_collect_signal, syscall_timeout_ms,
-	      program_timeout_ms, slowdown_scale, flag_coverage_filter);
+	      program_timeout_ms, slowdown_scale, req.prog_size, flag_coverage_filter);
 	if (syscall_timeout_ms == 0 || program_timeout_ms <= syscall_timeout_ms || slowdown_scale == 0)
 		failmsg("bad timeouts", "syscall=%llu, program=%llu, scale=%llu",
 			syscall_timeout_ms, program_timeout_ms, slowdown_scale);
+	if (SYZ_EXECUTOR_USES_SHMEM) {
+		if (req.prog_size)
+			fail("need_prog: no program");
+		return;
+	}
+	if (req.prog_size == 0)
+		fail("need_prog: no program");
+	uint64 pos = 0;
+	for (;;) {
+		ssize_t rv = read(kInPipeFd, input_data + pos, kMaxInput - pos);
+		if (rv < 0)
+			fail("read failed");
+		pos += rv;
+		if (rv == 0 || pos >= req.prog_size)
+			break;
+	}
+	if (pos != req.prog_size)
+		failmsg("bad input size", "size=%lld, want=%lld", pos, req.prog_size);
 }
 
 bool cover_collection_required()
@@ -711,6 +721,7 @@ void reply_execute(int status)
 		fail("control pipe write failed");
 }
 
+#if SYZ_EXECUTOR_USES_SHMEM
 void realloc_output_data()
 {
 #if SYZ_EXECUTOR_USES_FORK_SERVER
@@ -724,14 +735,17 @@ void realloc_output_data()
 		fail("failed to close kOutFd");
 #endif
 }
+#endif // if SYZ_EXECUTOR_USES_SHMEM
 
 // execute_one executes program stored in input_data.
 void execute_one()
 {
 	in_execute_one = true;
+#if SYZ_EXECUTOR_USES_SHMEM
 	realloc_output_data();
 	output_pos = output_data;
 	write_output(0); // Number of executed syscalls (updated later).
+#endif // if SYZ_EXECUTOR_USES_SHMEM
 	uint64 start = current_time_ms();
 	uint8* input_pos = input_data;
 
@@ -859,8 +873,10 @@ void execute_one()
 		const call_t* call = &syscalls[call_num];
 		if (prog_extra_timeout < call->attrs.prog_timeout)
 			prog_extra_timeout = call->attrs.prog_timeout * slowdown_scale;
-		if (call->attrs.remote_cover)
-			prog_extra_cover_timeout = 500 * slowdown_scale; // 500 ms
+		if (strncmp(syscalls[call_num].name, "syz_usb", strlen("syz_usb")) == 0)
+			prog_extra_cover_timeout = std::max(prog_extra_cover_timeout, 500 * slowdown_scale);
+		if (strncmp(syscalls[call_num].name, "syz_80211_inject_frame", strlen("syz_80211_inject_frame")) == 0)
+			prog_extra_cover_timeout = std::max(prog_extra_cover_timeout, 300 * slowdown_scale);
 		uint64 copyout_index = read_input(&input_pos);
 		uint64 num_args = read_input(&input_pos);
 		if (num_args > kMaxArgs)
@@ -984,6 +1000,7 @@ thread_t* schedule_call(int call_index, int call_num, uint64 copyout_index, uint
 	return th;
 }
 
+#if SYZ_EXECUTOR_USES_SHMEM
 template <typename cover_data_t>
 void write_coverage_signal(cover_t* cov, uint32* signal_count_pos, uint32* cover_count_pos)
 {
@@ -996,13 +1013,11 @@ void write_coverage_signal(cover_t* cov, uint32* signal_count_pos, uint32* cover
 		bool prev_filter = true;
 		for (uint32 i = 0; i < cov->size; i++) {
 			cover_data_t pc = cover_data[i] + cov->pc_offset;
-			uint64 sig = pc;
-			if (is_kernel_pc(pc) < 0)
-				exitf("got bad pc: 0x%llx", (uint64)pc);
+			uint32 sig = pc & 0xFFFFF000;
 			if (use_cover_edges(pc)) {
-				// Only hash the lower 12 bits so the hash is independent of any module offsets.
-				const uint64 mask = (1 << 12) - 1;
-				sig ^= hash(prev_pc & mask) & mask;
+				// Only hash the lower 12 bits so the hash is
+				// independent of any module offsets.
+				sig |= (pc & 0xFFF) ^ (hash(prev_pc & 0xFFF) & 0xFFF);
 			}
 			bool filter = coverage_filter(pc);
 			// Ignore the edge only if both current and previous PCs are filtered out
@@ -1012,7 +1027,7 @@ void write_coverage_signal(cover_t* cov, uint32* signal_count_pos, uint32* cover
 			prev_filter = filter;
 			if (ignore || dedup(sig))
 				continue;
-			write_output_64(sig);
+			write_output(sig);
 			nsig++;
 		}
 		// Write out number of signals.
@@ -1029,12 +1044,14 @@ void write_coverage_signal(cover_t* cov, uint32* signal_count_pos, uint32* cover
 			cover_size = std::unique(cover_data, end) - cover_data;
 			cover_protect(cov);
 		}
-		// Always sent uint64 PCs.
+		// Truncate PCs to uint32 assuming that they fit into 32-bits.
+		// True for x86_64 and arm64 without KASLR.
 		for (uint32 i = 0; i < cover_size; i++)
-			write_output_64(cover_data[i] + cov->pc_offset);
+			write_output(cover_data[i] + cov->pc_offset);
 		*cover_count_pos = cover_size;
 	}
 }
+#endif // if SYZ_EXECUTOR_USES_SHMEM
 
 void handle_completion(thread_t* th)
 {
@@ -1106,6 +1123,7 @@ void write_call_output(thread_t* th, bool finished)
 		call_flags |= call_flag_finished |
 			      (th->fault_injected ? call_flag_fault_injected : 0);
 	}
+#if SYZ_EXECUTOR_USES_SHMEM
 	write_output(kOutMagic);
 	write_output(th->call_index);
 	write_output(th->call_num);
@@ -1117,11 +1135,11 @@ void write_call_output(thread_t* th, bool finished)
 
 	if (flag_comparisons) {
 		// Collect only the comparisons
-		uint64 ncomps = *(uint64_t*)th->cov.data;
+		uint32 ncomps = th->cov.size;
 		kcov_comparison_t* start = (kcov_comparison_t*)(th->cov.data + sizeof(uint64));
 		kcov_comparison_t* end = start + ncomps;
 		if ((char*)end > th->cov.data_end)
-			failmsg("too many comparisons", "ncomps=%llu", ncomps);
+			failmsg("too many comparisons", "ncomps=%u", ncomps);
 		cover_unprotect(&th->cov);
 		std::sort(start, end);
 		ncomps = std::unique(start, end) - start;
@@ -1141,15 +1159,34 @@ void write_call_output(thread_t* th, bool finished)
 		else
 			write_coverage_signal<uint32>(&th->cov, signal_count_pos, cover_count_pos);
 	}
-	debug_verbose("out #%u: index=%u num=%u errno=%d finished=%d blocked=%d sig=%u cover=%u comps=%llu\n",
+	debug_verbose("out #%u: index=%u num=%u errno=%d finished=%d blocked=%d sig=%u cover=%u comps=%u\n",
 		      completed, th->call_index, th->call_num, reserrno, finished, blocked,
 		      *signal_count_pos, *cover_count_pos, *comps_count_pos);
 	completed++;
 	write_completed(completed);
+#else
+	call_reply reply;
+	reply.header.magic = kOutMagic;
+	reply.header.done = 0;
+	reply.header.status = 0;
+	reply.magic = kOutMagic;
+	reply.call_index = th->call_index;
+	reply.call_num = th->call_num;
+	reply.reserrno = reserrno;
+	reply.flags = call_flags;
+	reply.signal_size = 0;
+	reply.cover_size = 0;
+	reply.comps_size = 0;
+	if (write(kOutPipeFd, &reply, sizeof(reply)) != sizeof(reply))
+		fail("control pipe call write failed");
+	debug_verbose("out: index=%u num=%u errno=%d finished=%d blocked=%d\n",
+		      th->call_index, th->call_num, reserrno, finished, blocked);
+#endif // if SYZ_EXECUTOR_USES_SHMEM
 }
 
 void write_extra_output()
 {
+#if SYZ_EXECUTOR_USES_SHMEM
 	if (!cover_collection_required() || !flag_extra_coverage || flag_comparisons)
 		return;
 	cover_collect(&extra_cov);
@@ -1171,6 +1208,7 @@ void write_extra_output()
 	debug_verbose("extra: sig=%u cover=%u\n", *signal_count_pos, *cover_count_pos);
 	completed++;
 	write_completed(completed);
+#endif // if SYZ_EXECUTOR_USES_SHMEM
 }
 
 void thread_create(thread_t* th, int id, bool need_coverage)
@@ -1278,21 +1316,19 @@ void execute_call(thread_t* th)
 	debug("\n");
 }
 
+#if SYZ_EXECUTOR_USES_SHMEM
 static uint32 hash(uint32 a)
 {
-	// For test OS we disable hashing for determinism and testability.
-#if !GOOS_test
 	a = (a ^ 61) ^ (a >> 16);
 	a = a + (a << 3);
 	a = a ^ (a >> 4);
 	a = a * 0x27d4eb2d;
 	a = a ^ (a >> 15);
-#endif
 	return a;
 }
 
 const uint32 dedup_table_size = 8 << 10;
-uint64 dedup_table[dedup_table_size];
+uint32 dedup_table[dedup_table_size];
 
 // Poorman's best-effort hashmap-based deduplication.
 // The hashmap is global which means that we deduplicate across different calls.
@@ -1311,6 +1347,7 @@ static bool dedup(uint32 sig)
 	dedup_table[sig % dedup_table_size] = sig;
 	return false;
 }
+#endif // if SYZ_EXECUTOR_USES_SHMEM
 
 template <typename T>
 void copyin_int(char* addr, uint64 val, uint64 bf, uint64 bf_off, uint64 bf_len)
@@ -1484,7 +1521,7 @@ uint64 read_input(uint8** input_posp, bool peek)
 	for (int i = 0;; i++, shift += 7) {
 		const int maxLen = 10;
 		if (i == maxLen)
-			failmsg("varint overflow", "pos=%zu", (size_t)(*input_posp - input_data));
+			failmsg("varint overflow", "pos=%zu", *input_posp - input_data);
 		if (input_pos >= input_data + kMaxInput)
 			failmsg("input command overflows input", "pos=%p: [%p:%p)",
 				input_pos, input_data, input_data + kMaxInput);
@@ -1492,7 +1529,7 @@ uint64 read_input(uint8** input_posp, bool peek)
 		v |= uint64(b & 0x7f) << shift;
 		if (b < 0x80) {
 			if (i == maxLen - 1 && b > 1)
-				failmsg("varint overflow", "pos=%zu", (size_t)(*input_posp - input_data));
+				failmsg("varint overflow", "pos=%zu", *input_posp - input_data);
 			break;
 		}
 	}
@@ -1505,6 +1542,7 @@ uint64 read_input(uint8** input_posp, bool peek)
 	return v;
 }
 
+#if SYZ_EXECUTOR_USES_SHMEM
 uint32* write_output(uint32 v)
 {
 	if (output_pos < output_data || (char*)output_pos >= (char*)output_data + output_size)
@@ -1528,7 +1566,9 @@ void write_completed(uint32 completed)
 {
 	__atomic_store_n(output_data, completed, __ATOMIC_RELEASE);
 }
+#endif // if SYZ_EXECUTOR_USES_SHMEM
 
+#if SYZ_EXECUTOR_USES_SHMEM
 void kcov_comparison_t::write()
 {
 	if (type > (KCOV_CMP_CONST | KCOV_CMP_SIZE_MASK))
@@ -1572,21 +1612,32 @@ bool kcov_comparison_t::ignore() const
 	// Comparisons with 0 are not interesting, fuzzer should be able to guess 0's without help.
 	if (arg1 == 0 && (arg2 == 0 || (type & KCOV_CMP_CONST)))
 		return true;
-	// This can be a pointer (assuming 64-bit kernel).
-	// First of all, we want avert fuzzer from our output region.
-	// Without this fuzzer manages to discover and corrupt it.
-	uint64 out_start = (uint64)output_data;
-	uint64 out_end = out_start + output_size;
-	if (arg1 >= out_start && arg1 <= out_end)
-		return true;
-	if (arg2 >= out_start && arg2 <= out_end)
-		return true;
-	// Filter out kernel physical memory addresses.
-	// These are internal kernel comparisons and should not be interesting.
-	bool kptr1 = is_kernel_data(arg1) || is_kernel_pc(arg1) > 0 || arg1 == 0;
-	bool kptr2 = is_kernel_data(arg2) || is_kernel_pc(arg2) > 0 || arg2 == 0;
-	if (kptr1 && kptr2)
-		return true;
+	if ((type & KCOV_CMP_SIZE_MASK) == KCOV_CMP_SIZE8) {
+		// This can be a pointer (assuming 64-bit kernel).
+		// First of all, we want avert fuzzer from our output region.
+		// Without this fuzzer manages to discover and corrupt it.
+		uint64 out_start = (uint64)output_data;
+		uint64 out_end = out_start + output_size;
+		if (arg1 >= out_start && arg1 <= out_end)
+			return true;
+		if (arg2 >= out_start && arg2 <= out_end)
+			return true;
+#if defined(GOOS_linux)
+		// Filter out kernel physical memory addresses.
+		// These are internal kernel comparisons and should not be interesting.
+		// The range covers first 1TB of physical mapping.
+		uint64 kmem_start = (uint64)0xffff880000000000ull;
+		uint64 kmem_end = (uint64)0xffff890000000000ull;
+		bool kptr1 = arg1 >= kmem_start && arg1 <= kmem_end;
+		bool kptr2 = arg2 >= kmem_start && arg2 <= kmem_end;
+		if (kptr1 && kptr2)
+			return true;
+		if (kptr1 && arg2 == 0)
+			return true;
+		if (kptr2 && arg1 == 0)
+			return true;
+#endif
+	}
 	return !coverage_filter(pc);
 }
 
@@ -1605,6 +1656,11 @@ bool kcov_comparison_t::operator<(const struct kcov_comparison_t& other) const
 	// We don't check for PC equality now, because it is not used.
 	return arg2 < other.arg2;
 }
+#endif // if SYZ_EXECUTOR_USES_SHMEM
+
+#if !SYZ_HAVE_FEATURES
+static feature_t features[] = {};
+#endif
 
 void setup_features(char** enable, int n)
 {
@@ -1631,9 +1687,7 @@ void setup_features(char** enable, int n)
 	}
 	for (size_t i = 0; i < sizeof(features) / sizeof(features[0]); i++) {
 		if (features[i].id == feature) {
-			const char* reason = features[i].setup();
-			if (reason)
-				fail(reason);
+			features[i].setup();
 			return;
 		}
 	}
