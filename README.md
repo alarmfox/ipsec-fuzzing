@@ -14,9 +14,9 @@ Per compilare syzkaller è consigliato attivare l'ambiente di build
 `./syzkaller/tools/syz-env`.
 
 ```sh 
-./tools/syz-env
+$ ./tools/syz-env
 gcr.io/syzkaller/env:latest
-syz-env make
+$ syz-env: make
 ```
 
 ## Compilazione kernel
