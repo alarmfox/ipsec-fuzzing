@@ -1,17 +1,10 @@
 # Progetto software security
-Progetto basato su syzkaller per il fuzzing del kernel Linux.
+Project based on syzkaller for fuzzing the Linux kernel.
 
-Il progetto cerca di effettuare il fuzzing dell'implementazione 
-di IPsec e delle strutture associate in Linux.
-
-Nel file `DOC-Capasso-m63001498.pdf` è contenuta la documentazione 
-del progetto con annesse istruzioni per l'esecuzione. Il setup 
-funziona su Linux utilizzando QEMU e KVM come sistema di virtualizzazione.
+The project aims to perform fuzzing on the implementation of IPsec and its associated structures in Linux.
 
 ## Compilazione syzkaller
-Per compilare syzkaller è consigliato attivare l'ambiente di build 
-(richiede Docker installato) attraverso lo script in 
-`./syzkaller/tools/syz-env`.
+To compile syzkaller, it is recommended to activate the build environment (requires Docker installed) using the script in `-/syzkaller/tools/syz-env`.
 
 ```sh 
 $ ./tools/syz-env
@@ -20,8 +13,8 @@ $ syz-env: make
 ```
 
 ## Compilazione kernel
-Prima di compilare il kernel, bisogna configurarlo con l'instrumentazione. 
-Una lista dei parametri fondamentali è:
+Before compiling the kernel, it must be configured with instrumentation.
+A list of essential parameters is:
 
 ```
 # Coverage collection.
@@ -39,26 +32,21 @@ CONFIG_CONFIGFS_FS=y
 CONFIG_SECURITYFS=y
 ```
 
-È possibile aggiungere altri parametri per l'instrumentazione per rendere l'analisi più
-precisa (la lista completa è disponibile 
-[qui](https://github.com/google/syzkaller/blob/master/docs/linux/kernel_configs.md)).
-Infine è possibile compilare con:
+Other instrumentation parameters can be added to make the analysis more precise (the full list is available [here](https://github.com/google/syzkaller/blob/master/docs/linux/kernel_configs.md)
+Finally, you can compile with:
 ```sh 
 make -j `nproc`
 ```
 
-## Generazione immagine
-L'immagine può essere generata a partire dal programma `debootstrap` e usando 
-lo script presente in `./syzkaller/tools/create-image.sh` (bisogna usare sudo). 
-Per un'immagine completa:
+## Create an image
+The image can be generated using the debootstrap program and the script in ./syzkaller/tools/create-image.sh (sudo is required).
+The script generates a Debian image and a pair of SSH keys. For a full image:
 ```sh 
 $ sudo ./create-image.sh --feature full
 ```
-Lo script genera un'immagine Debian e una coppia di chiavi SSH.
 
-## Esecuzione
-Per eseguire il programma, bisogna definire un file come quello di seguito.
-in cui bisogna sostituire a $SYZKALLER, $KERNEL e $IMAGE i path alle cartelle giuste.
+## Execution
+To run the program, you need to create a configuration file like the one below, replacing $SYZKALLER, $KERNEL, and $IMAGE with the correct paths.
 ```json
 {
         "target": "linux/amd64",
@@ -79,7 +67,7 @@ in cui bisogna sostituire a $SYZKALLER, $KERNEL e $IMAGE i path alle cartelle gi
 }
 ```
 
-Infine, è possibile lanciare syz-manager con il comando:
+Finally, syzkaller can be run with:
 ```sh 
 ./syzkaller/syzkaller/bin/syz-manager -config syzkaller/config.json
 
