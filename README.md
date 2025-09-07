@@ -1,9 +1,9 @@
-# Progetto software security
+# IPSec fuzzing
 Project based on syzkaller for fuzzing the Linux kernel.
 
 The project aims to perform fuzzing on the implementation of IPsec and its associated structures in Linux.
 
-## Compilazione syzkaller
+## Building syzkaller
 To compile syzkaller, it is recommended to activate the build environment (requires Docker installed) using the script in `-/syzkaller/tools/syz-env`.
 
 ```sh 
@@ -12,7 +12,7 @@ gcr.io/syzkaller/env:latest
 $ syz-env: make
 ```
 
-## Compilazione kernel
+## Building the kernel
 Before compiling the kernel, it must be configured with instrumentation.
 A list of essential parameters is:
 
